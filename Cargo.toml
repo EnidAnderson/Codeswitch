@@ -1,0 +1,24 @@
+[package]
+name = "codeswitch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
+bincode = "0.8"
+tcb_core = { path = "../clean_kernel/tcb_core" }
+new_surface_syntax = { path = "../clean_kernel/satellites/src/surface_maclane/NewSurfaceSyntaxModule" }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "normalization"
+harness = false
+
+[[bench]]
+name = "query_engine"
+harness = false

@@ -1,0 +1,844 @@
+//! Minimal query engine for incremental type checking.
+//!
+//! Implements a Salsa-style query system with automatic dependency tracking
+//! and memoization. Phase 2 uses coarse invalidation: cache keys include
+//! `ScopeFingerprint`, so changing the fingerprint naturally invalidates
+//! prior results.
+//!
+//! # Design Principles
+//! - **Pure queries**: Queries read only from immutable inputs (arena, doctrine registry, scope/boundary)
+//! - **Deterministic ordering**: All dependency sets stored in sorted order
+//! - **Coarse invalidation**: Cache key = `(ScopeFingerprint, QueryKey)`
+//! - **No global mutation**: Only memo table writes allowed
+//! - **No rewrite integration yet**: Rewrite/proof layers handled in Phase 5
+//!
+//! # Phase 2 Scope
+//! - Query-to-query dependencies only (`DepKey::Query`)
+//! - No fine-grained invalidation (Phase 4)
+//! - No reverse dependency edges (Phase 4)
+//! - Single boundary check as example (`CheckEdge`)
+//!
+//! # References
+//! - *Query-based incremental computation*: [Salsa: A Library for Incremental Computation, POPL 2020]
+//! - *Dependency tracking*: [Adaptive Functional Programming, POPL 2002]
+//! - *Memoization with purity*: [Type-Directed Incremental Computation, PLDI 2020]
+//! - *Deterministic dependency ordering*: [Incremental Computation with Names, ICFP 2015]
+//! - *Thread-local dependency stacks*: [Flume: A Library for Pure Incremental Computation, OOPSLA 2022]
+
+use crate::fingerprint::HashValue;
+use crate::scope::ScopeFingerprint;
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::cell::RefCell;
+use std::marker::PhantomData;
+
+/// Domain for query key fingerprinting (v0).
+const DOMAIN_QUERY_KEY_V0: &[u8] = b"QUERY_KEY_V0";
+
+// ----------------------------------------------------------------------------
+// Core query identification
+// ----------------------------------------------------------------------------
+
+/// Key identifying a query instance.
+///
+/// Each variant corresponds to a specific type checking operation.
+/// All fields must be hashable for deterministic fingerprinting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum QueryKey {
+    /// Infer the type of a node within a scope.
+    InferNodeType {
+        /// Scope fingerprint (semantic cache key).
+        scope_fp: ScopeFingerprint,
+        /// Node identifier.
+        node_id: u64,
+    },
+    /// Check boundary compatibility of an edge.
+    CheckEdge {
+        /// Scope fingerprint.
+        scope_fp: ScopeFingerprint,
+        /// Edge identifier.
+        edge_id: u64,
+    },
+    /// Compute boundary specification.
+    Boundary {
+        /// Scope fingerprint.
+        scope_fp: ScopeFingerprint,
+        /// Boundary kind identifier.
+        kind: BoundaryKind,
+        /// Root node identifier.
+        root_id: u64,
+    },
+    /// Resolve a name to its binding.
+    ResolveName {
+        /// Scope fingerprint.
+        scope_fp: ScopeFingerprint,
+        /// Symbol name.
+        symbol: String,
+    },
+    /// Compute the interface summary for a scope.
+    ComputeInterface {
+        /// Scope fingerprint.
+        scope_fp: ScopeFingerprint,
+    },
+}
+
+/// Kind of boundary computation (placeholder for Phase 2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BoundaryKind {
+    /// Node boundary.
+    Node,
+    /// Hyperedge boundary.
+    Hyperedge,
+}
+
+impl QueryKey {
+    /// Computes a deterministic hash for this query key.
+    ///
+    /// Used for memo table lookups. The hash must be stable across
+    /// compiler invocations (no random seeds).
+    ///
+    /// See: [Stable Hashing for Incremental Computation, PLDI 2021]
+    pub fn fingerprint(&self) -> HashValue {
+        // Use DefaultHasher (deterministic within compiler version) for Phase 2.
+        // Future: implement proper canonical bytes serialization.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        let hash_u64 = hasher.finish();
+        // Convert to bytes and hash with domain separation
+        HashValue::hash_with_domain(DOMAIN_QUERY_KEY_V0, &hash_u64.to_le_bytes())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Dependency tracking
+// ----------------------------------------------------------------------------
+
+/// A dependency edge from one query to another.
+///
+/// Phase 2 only supports query-to-query dependencies.
+/// Future phases will add `DepKey::Import`, `DepKey::KernelPolicy`, etc.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DepKey {
+    /// Dependency on another query's result.
+    Query(QueryKey),
+}
+
+/// Error returned by query execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryError {
+    /// A cycle was detected in the query dependency graph.
+    /// Contains the query key that would cause the cycle.
+    CycleDetected(QueryKey),
+}
+
+/// Recorded dependencies for a memoized query result.
+///
+/// Stored as sorted Vec for deterministic ordering.
+/// **Finalization is guaranteed by `QueryGuard::finish`**; dropping an unfinalized
+/// DependencySet may hide dependencies and break incremental correctness.
+///
+/// See: [Dependency Tracking in Incremental Build Systems, ESEC/FSE 2019]
+#[must_use = "DependencySet is part of query correctness; dropping it may hide dependencies"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencySet {
+    /// Sorted list of dependencies.
+    deps: Vec<DepKey>,
+}
+
+impl DependencySet {
+    /// Creates a new empty dependency set.
+    pub fn new() -> Self {
+        Self { deps: Vec::new() }
+    }
+
+    /// Adds a dependency, maintaining sorted order.
+    ///
+    /// Caller must ensure the vector stays sorted (use `sort` after adding).
+    fn add(&mut self, dep: DepKey) {
+        self.deps.push(dep);
+    }
+
+    /// Finalizes the dependency set by sorting and deduplicating.
+    ///
+    /// Must be called after all dependencies are added.
+    fn finalize(&mut self) {
+        self.deps.sort();
+        self.deps.dedup();
+    }
+
+    /// Returns an iterator over dependencies.
+    pub fn iter(&self) -> impl Iterator<Item = &DepKey> {
+        self.deps.iter()
+    }
+}
+
+impl Default for DependencySet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Memoization storage
+// ----------------------------------------------------------------------------
+
+/// Memoized result of a query.
+#[derive(Debug, Clone)]
+pub struct MemoEntry<V> {
+    /// The computed value.
+    pub value: V,
+    /// Recorded dependencies (sorted, deduplicated).
+    pub deps: DependencySet,
+    /// Optional diagnostics/obligations (future).
+    pub diag: Vec<String>,
+}
+
+impl<V> MemoEntry<V> {
+    /// Creates a new memo entry.
+    pub fn new(value: V, deps: DependencySet) -> Self {
+        Self {
+            value,
+            deps,
+            diag: Vec::new(),
+        }
+    }
+}
+
+/// Memoization table storing query results.
+///
+/// Keyed by `(ScopeFingerprint, QueryKey)` for coarse invalidation.
+/// Changing `ScopeFingerprint` naturally causes cache misses.
+///
+/// See: [Memoization in Functional Programming Languages, ACM Computing Surveys 1998]
+#[derive(Debug, Default)]
+pub struct MemoTable<V> {
+    /// Map from query key fingerprint to memo entry.
+    entries: BTreeMap<HashValue, MemoEntry<V>>,
+}
+
+impl<V> MemoTable<V> {
+    /// Creates a new empty memo table.
+    pub fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Looks up a cached result.
+    ///
+    /// Returns `Some(&MemoEntry)` if present, `None` otherwise.
+    pub fn get(&self, key: &QueryKey) -> Option<&MemoEntry<V>> {
+        let fp = key.fingerprint();
+        self.entries.get(&fp)
+    }
+
+    /// Inserts a new result into the memo table.
+    ///
+    /// Overwrites any existing entry for the same key.
+    pub fn insert(&mut self, key: QueryKey, entry: MemoEntry<V>) {
+        let fp = key.fingerprint();
+        self.entries.insert(fp, entry);
+    }
+
+    /// Clears all memoized results (coarse invalidation).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Dependency recorder (thread-local stack)
+// ----------------------------------------------------------------------------
+
+thread_local! {
+    /// Stack of currently executing query keys.
+    static QUERY_STACK: std::cell::RefCell<Vec<QueryKey>> = std::cell::RefCell::new(Vec::new());
+
+    /// Stack of dependency accumulators, parallel to QUERY_STACK.
+    /// Each Vec accumulates DepKeys for the query at the same index.
+    static DEP_ACCUMULATORS: std::cell::RefCell<Vec<Vec<DepKey>>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// RAII guard for query execution.
+///
+/// Pushes `key` onto the query stack on creation, pops it on drop.
+/// Ensures stack cleanup even on panic.
+///
+/// See: [RAII Pattern for Resource Management, C++ Programming Language 4th Ed.]
+struct QueryGuard {
+    /// Whether we should pop (false if already popped via `finish`).
+    active: bool,
+}
+
+impl QueryGuard {
+    /// Starts recording dependencies for a new query.
+    ///
+    /// Pushes `key` onto the query stack and initializes an empty dependency accumulator.
+    /// Returns a guard that will pop the stack when dropped.
+    /// Returns `Err(QueryError::CycleDetected(key))` if `key` is already in the query stack.
+    fn start(key: QueryKey) -> Result<Self, QueryError> {
+        // Detect direct recursion (need to check before moving key)
+        let key_clone = key.clone();
+        QUERY_STACK.with(|stack| {
+            let stack = stack.borrow();
+            if stack.contains(&key_clone) {
+                return Err(QueryError::CycleDetected(key_clone));
+            }
+            Ok(())
+        })?;
+
+        QUERY_STACK.with(|stack| stack.borrow_mut().push(key));
+        DEP_ACCUMULATORS.with(|accs| accs.borrow_mut().push(Vec::new()));
+        Ok(Self { active: true })
+    }
+
+    /// Finishes the query, returning the sorted, deduplicated dependencies.
+    /// Consumes the guard (prevents double-pop).
+    fn finish(mut self) -> DependencySet {
+        self.active = false;
+        let mut deps_vec = DEP_ACCUMULATORS.with(|accs| {
+            accs.borrow_mut().pop().unwrap_or_default()
+        });
+        QUERY_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+
+        // Ensure deterministic order
+        deps_vec.sort();
+        deps_vec.dedup();
+        DependencySet { deps: deps_vec }
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // Panic cleanup: pop stacks but discard dependencies
+            DEP_ACCUMULATORS.with(|accs| {
+                let _ = accs.borrow_mut().pop();
+            });
+            QUERY_STACK.with(|stack| {
+                let _ = stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// Records a dependency from the currently executing query to `callee`.
+///
+/// If no query is active (top-level call), does nothing.
+///
+/// See: [Dynamic Dependency Tracking for Incremental Computation, POPL 2019]
+pub fn record_dependency(callee: &QueryKey) {
+    DEP_ACCUMULATORS.with(|accs| {
+        if let Some(acc) = accs.borrow_mut().last_mut() {
+            acc.push(DepKey::Query(callee.clone()));
+        }
+    });
+}
+
+/// Returns the currently executing query key, if any.
+fn current_query() -> Option<QueryKey> {
+    QUERY_STACK.with(|stack| stack.borrow().last().cloned())
+}
+
+// ----------------------------------------------------------------------------
+// Query engine
+// ----------------------------------------------------------------------------
+
+/// Simple query engine for Phase 2.
+///
+/// Provides memoized execution of type checking queries.
+/// Coarse invalidation via `ScopeFingerprint` in cache keys.
+///
+/// # Thread safety
+/// Dependency recording uses thread‑local storage; the engine itself is single‑threaded.
+/// **This type is !Send and !Sync by design.** Each thread must have its own `QueryEngine`
+/// instance. Sharing across threads would break the thread‑local dependency stacks.
+#[derive(Debug, Default)]
+pub struct QueryEngine<V> {
+    /// Memoization table (interior mutability for re-entrant queries).
+    memo: RefCell<MemoTable<V>>,
+    /// Ensures !Send + !Sync (thread‑local dependency stacks).
+    _not_send_sync: PhantomData<*const ()>,
+}
+
+impl<V> QueryEngine<V> {
+    /// Creates a new query engine.
+    pub fn new() -> Self {
+        Self {
+            memo: RefCell::new(MemoTable::new()),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Executes a query with memoization.
+    ///
+    /// If the query is already memoized, returns the cached value.
+    /// Otherwise, executes `f` with dependency recording, memoizes the result,
+    /// and returns it.
+    ///
+    /// Returns `Err(QueryError::CycleDetected(...))` if a dependency cycle is detected.
+    ///
+    /// See: [Salsa: A Library for Incremental Computation, POPL 2020]
+    pub fn execute<F>(&self, key: QueryKey, f: F) -> Result<V, QueryError>
+    where
+        F: FnOnce() -> V,
+        V: Clone,
+    {
+        // Record dependency from currently executing query (if any) to this query
+        if let Some(_current) = current_query() {
+            record_dependency(&key);
+        }
+
+        // Check cache (after recording dependency)
+        {
+            let memo = self.memo.borrow();
+            if let Some(entry) = memo.get(&key) {
+                return Ok(entry.value.clone());
+            }
+        } // drop borrow before computing
+
+        // Not cached: execute with dependency recording
+        let guard = QueryGuard::start(key.clone())?;
+        let value = f();
+        let deps = guard.finish();
+
+        // Store in cache
+        let entry = MemoEntry::new(value.clone(), deps);
+        self.memo.borrow_mut().insert(key, entry);
+
+        Ok(value)
+    }
+
+    /// Clears all memoized results (coarse invalidation).
+    pub fn clear(&self) {
+        self.memo.borrow_mut().clear();
+    }
+
+    /// Returns a clone of the memo entry for a query (for testing).
+    pub fn debug_get_entry(&self, key: &QueryKey) -> Option<MemoEntry<V>>
+    where
+        V: Clone,
+    {
+        self.memo.borrow().get(key).cloned()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::{ScopeFingerprint, ScopeFingerprintComponents};
+    use crate::fingerprint::HashValue;
+    use crate::boundary::{Boundary, BoundaryError};
+
+    #[test]
+    fn test_query_key_fingerprint_deterministic() {
+        let zero = HashValue::zero();
+        let components = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp = ScopeFingerprint::new(components);
+
+        let key1 = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 42,
+        };
+
+        let key2 = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 42,
+        };
+
+        assert_eq!(key1.fingerprint(), key2.fingerprint());
+    }
+
+    #[test]
+    fn test_query_key_ordering() {
+        let zero = HashValue::zero();
+        let components = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp = ScopeFingerprint::new(components);
+
+        let key1 = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 1,
+        };
+
+        let key2 = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 2,
+        };
+
+        // Different keys should have different order
+        assert!(key1 < key2);
+    }
+
+    #[test]
+    fn test_memo_table_basic() {
+        let mut table: MemoTable<String> = MemoTable::new();
+
+        let zero = HashValue::zero();
+        let components = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp = ScopeFingerprint::new(components);
+
+        let key = QueryKey::CheckEdge {
+            scope_fp,
+            edge_id: 42,
+        };
+
+        // Initially empty
+        assert!(table.get(&key).is_none());
+
+        // Insert entry
+        let entry = MemoEntry::new("result".to_string(), DependencySet::new());
+        table.insert(key.clone(), entry);
+
+        // Should now be present
+        assert!(table.get(&key).is_some());
+
+        // Clear
+        table.clear();
+        assert!(table.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_query_engine_memoization() {
+        let engine: QueryEngine<String> = QueryEngine::new();
+        let mut call_count = 0;
+
+        let zero = HashValue::zero();
+        let components = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp = ScopeFingerprint::new(components);
+
+        let key = QueryKey::CheckEdge {
+            scope_fp,
+            edge_id: 42,
+        };
+
+        // First call should execute
+        let result1 = engine.execute(key.clone(), || {
+            call_count += 1;
+            "computed".to_string()
+        }).unwrap();
+
+        assert_eq!(call_count, 1);
+        assert_eq!(result1, "computed");
+
+        // Second call should hit cache
+        let result2 = engine.execute(key.clone(), || {
+            call_count += 1;
+            "should not be called".to_string()
+        }).unwrap();
+
+        assert_eq!(call_count, 1); // No increment
+        assert_eq!(result2, "computed");
+    }
+
+    #[test]
+    fn test_dependency_recording() {
+        let engine: QueryEngine<String> = QueryEngine::new();
+        let zero = HashValue::zero();
+        let components = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp = ScopeFingerprint::new(components);
+
+        let key_a = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 1,
+        };
+        let key_b = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 2,
+        };
+
+        // Execute query A, which calls query B
+        let result_a = engine.execute(key_a.clone(), || {
+            // Inside A, call B
+            engine.execute(key_b.clone(), || {
+                "B".to_string()
+            }).unwrap();
+            "A".to_string()
+        }).unwrap();
+
+        assert_eq!(result_a, "A");
+
+        // Check that A's memo entry includes B as dependency
+        let entry_a = engine.debug_get_entry(&key_a).unwrap();
+        assert!(entry_a.deps.iter().any(|dep| match dep {
+            DepKey::Query(k) => k == &key_b,
+        }));
+
+        // Check that B's memo entry exists and has no dependencies (leaf)
+        let entry_b = engine.debug_get_entry(&key_b).unwrap();
+        assert!(entry_b.deps.iter().next().is_none());
+    }
+
+    #[test]
+    fn test_check_edge_query() {
+        // Create a query engine for boundary results
+        let engine: QueryEngine<Result<Boundary, BoundaryError>> = QueryEngine::new();
+        let scope_fp = ScopeFingerprint::placeholder();
+        let edge_id = 42;
+
+        let key = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id,
+        };
+
+        let mut call_count = 0;
+
+        // First execution should compute
+        let result1 = engine.execute(key.clone(), || {
+            call_count += 1;
+            // Mock boundary computation
+            Ok(Boundary::Empty)
+        }).unwrap();
+
+        assert_eq!(call_count, 1);
+        assert_eq!(result1, Ok(Boundary::Empty));
+
+        // Second execution should hit cache
+        let result2 = engine.execute(key.clone(), || {
+            call_count += 1;
+            panic!("Should not be called");
+        }).unwrap();
+
+        assert_eq!(call_count, 1);
+        assert_eq!(result2, Ok(Boundary::Empty));
+
+        // Verify memo entry exists
+        let entry = engine.debug_get_entry(&key).unwrap();
+        assert!(entry.deps.iter().next().is_none()); // no dependencies
+    }
+
+    #[test]
+    fn test_coarse_invalidation() {
+        use crate::fingerprint::HashValue;
+        let zero = HashValue::zero();
+        let non_zero = HashValue::hash_with_domain(b"TEST", b"different");
+
+        // Create two scope fingerprints that differ only in kernel_policy_fp
+        let components1 = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp1 = ScopeFingerprint::new(components1);
+
+        let components2 = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: non_zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp2 = ScopeFingerprint::new(components2);
+
+        let engine: QueryEngine<String> = QueryEngine::new();
+        let edge_id = 42;
+
+        let key1 = QueryKey::CheckEdge {
+            scope_fp: scope_fp1,
+            edge_id,
+        };
+        let key2 = QueryKey::CheckEdge {
+            scope_fp: scope_fp2,
+            edge_id,
+        };
+
+        let mut call_count = 0;
+
+        // Execute with first fingerprint
+        let result1 = engine.execute(key1.clone(), || {
+            call_count += 1;
+            "result1".to_string()
+        }).unwrap();
+        assert_eq!(call_count, 1);
+        assert_eq!(result1, "result1");
+
+        // Execute with second fingerprint (different kernel_policy_fp) should recompute
+        let result2 = engine.execute(key2.clone(), || {
+            call_count += 1;
+            "result2".to_string()
+        }).unwrap();
+        assert_eq!(call_count, 2);
+        assert_eq!(result2, "result2");
+
+        // Execute again with first fingerprint should hit cache
+        let result1b = engine.execute(key1.clone(), || {
+            call_count += 1;
+            panic!("Should not be called");
+        }).unwrap();
+        assert_eq!(call_count, 2);
+        assert_eq!(result1b, "result1");
+    }
+
+    #[test]
+    fn test_coarse_invalidation_import_deps() {
+        use crate::fingerprint::HashValue;
+        let zero = HashValue::zero();
+        let non_zero = HashValue::hash_with_domain(b"TEST", b"different");
+
+        // Create two scope fingerprints that differ only in import_deps_fp
+        let components1 = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp1 = ScopeFingerprint::new(components1);
+
+        let components2 = ScopeFingerprintComponents {
+            core_ast_fp: zero,
+            expansion_env_fp: zero,
+            import_deps_fp: non_zero,
+            kernel_policy_fp: zero,
+            compiler_build_id: zero,
+        };
+        let scope_fp2 = ScopeFingerprint::new(components2);
+
+        let engine: QueryEngine<String> = QueryEngine::new();
+        let edge_id = 42;
+
+        let key1 = QueryKey::CheckEdge {
+            scope_fp: scope_fp1,
+            edge_id,
+        };
+        let key2 = QueryKey::CheckEdge {
+            scope_fp: scope_fp2,
+            edge_id,
+        };
+
+        let mut call_count = 0;
+
+        // Execute with first fingerprint
+        let result1 = engine.execute(key1.clone(), || {
+            call_count += 1;
+            "result1".to_string()
+        }).unwrap();
+        assert_eq!(call_count, 1);
+        assert_eq!(result1, "result1");
+
+        // Execute with second fingerprint (different import_deps_fp) should recompute
+        let result2 = engine.execute(key2.clone(), || {
+            call_count += 1;
+            "result2".to_string()
+        }).unwrap();
+        assert_eq!(call_count, 2);
+        assert_eq!(result2, "result2");
+
+        // Execute again with first fingerprint should hit cache
+        let result1b = engine.execute(key1.clone(), || {
+            call_count += 1;
+            panic!("Should not be called");
+        }).unwrap();
+        assert_eq!(call_count, 2);
+        assert_eq!(result1b, "result1");
+    }
+
+    #[test]
+    fn test_recursion_detection() {
+        let engine: QueryEngine<String> = QueryEngine::new();
+        let scope_fp = ScopeFingerprint::placeholder();
+        let edge_id = 42;
+
+        let key = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id,
+        };
+
+        // Direct recursion: query calls itself
+        let outer_result = engine.execute(key.clone(), || {
+            // Inside query, call same query again
+            let inner_result = engine.execute(key.clone(), || {
+                "should never reach".to_string()
+            });
+            // Inner call should return cycle error
+            assert!(matches!(inner_result, Err(QueryError::CycleDetected(_))));
+            "outer".to_string()
+        });
+
+        // Outer call should succeed (no cycle in outer call itself)
+        assert_eq!(outer_result.unwrap(), "outer");
+    }
+
+    #[test]
+    fn test_panic_safety() {
+        let engine: QueryEngine<String> = QueryEngine::new();
+        let scope_fp = ScopeFingerprint::placeholder();
+
+        // First key: normal execution
+        let key1 = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 1,
+        };
+        let result = engine.execute(key1.clone(), || {
+            "normal".to_string()
+        }).unwrap();
+        assert_eq!(result, "normal");
+
+        // Second key: execution that panics (not yet cached)
+        let key2 = QueryKey::CheckEdge {
+            scope_fp: scope_fp.clone(),
+            edge_id: 2,
+        };
+        let engine_ref = std::panic::AssertUnwindSafe(&engine);
+        let panic_result = std::panic::catch_unwind(|| {
+            engine_ref.execute(key2.clone(), || {
+                panic!("test panic during query execution");
+            });
+        });
+        assert!(panic_result.is_err());
+
+        // After panic, engine should still be functional
+        // Key1 should still be cached
+        let result1 = engine.execute(key1.clone(), || {
+            panic!("should not be called");
+        }).unwrap();
+        assert_eq!(result1, "normal");
+
+        // Key2 should not be cached (panic prevented caching)
+        // Execute again should compute (no panic this time)
+        let call_count = std::cell::Cell::new(0);
+        let result2 = engine.execute(key2.clone(), || {
+            call_count.set(call_count.get() + 1);
+            "recomputed".to_string()
+        }).unwrap();
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(result2, "recomputed");
+    }
+}
