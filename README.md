@@ -58,7 +58,7 @@ These are **semantic choices**, not limitations of the underlying representation
 
 ### Summary
 
-Codeswitch’s ω‑hypergraph core is **already a pattern‑graph representation**. The “ω‑hypergraph” terminology reflects its mathematical heritage, but the implementation is a general directed acyclic hypergraph capable of expressing arbitrary multi‑source/multi‑target relations. All dimension‑stratification, globularity, and boundary‑operator constraints are optional and enforced via the doctrine system, not hard‑wired into the data model.
+Codeswitch’s ω‑hypergraph core is **a pattern‑graph representation**. The “ω‑hypergraph” terminology reflects its mathematical heritage, but the implementation is a general directed acyclic hypergraph capable of expressing arbitrary multi‑source/multi‑target relations. All dimension‑stratification, globularity, and boundary‑operator constraints are optional and enforced via the doctrine system, not hard‑wired into the data model.  A "pattern-graph" is similar to a port-typed hypergraph, whose hyperedges represent typed (n,m)-ary relations, but with the linear shape "(n,m)" replaced by a more general notion of structured pattern of ports.
 
 ## Core Abstractions
 
@@ -108,7 +108,7 @@ The second example demonstrates the full generality of the representation: hyper
 
 ## Integration with Surface Syntax (Comrade Lisp)
 
-Codeswitch is designed to be the backend for the new Comrade Lisp surface‑syntax module. The integration path is:
+Codeswitch is designed to be the backend for the Comrade Lisp surface‑syntax module. The integration path is:
 
 1. Surface syntax parses source text into an s‑expression AST.
 2. Macros expand the AST into core forms (`begin`, `touch`, `def`, `rule`).
