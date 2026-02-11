@@ -382,8 +382,12 @@ pub fn definitional_hashes<P: PayloadFingerprint>(
 ///
 /// # Determinism guarantee
 /// Nodes and edges are processed in sorted order (by NodeId for nodes,
-/// by (sources, targets) for edges). The resulting hash is invariant
-/// under isomorphism of the hypergraph.
+/// by (sources, targets) for edges). The resulting hash is deterministic
+/// for a fixed representation.
+///
+/// Policy note:
+/// `graph_fingerprint` is representation-sensitive. Pure internal ID renaming
+/// may change the fingerprint even when two graphs are isomorphic.
 pub fn graph_fingerprint<P: PayloadFingerprint>(graph: &Codeswitch<P>) -> HashValue {
     // Collect sorted node IDs and their definitional hashes
     let node_hashes = definitional_hashes(graph);
@@ -415,4 +419,43 @@ pub fn graph_fingerprint<P: PayloadFingerprint>(graph: &Codeswitch<P>) -> HashVa
     combined_data.extend_from_slice(&edge_data);
 
     HashValue::hash_with_domain(b"GRAPH_FINGERPRINT", &combined_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::graph_fingerprint;
+    use crate::core::{Codeswitch, HyperEdge, Node, NodeId};
+    use std::collections::HashSet;
+
+    fn graph_with_ids(a: u64, b: u64) -> Codeswitch<&'static str> {
+        let mut graph = Codeswitch::new();
+        graph.add_node_raw(Node::new(NodeId::new(a), "A", 0));
+        graph.add_node_raw(Node::new(NodeId::new(b), "B", 0));
+        graph.add_edge_raw(HyperEdge::new(
+            HashSet::from([NodeId::new(a)]),
+            HashSet::from([NodeId::new(b)]),
+        ));
+        graph
+    }
+
+    #[test]
+    fn graph_fingerprint_representation_sensitive_under_id_renaming() {
+        // Same shape/payload, different internal IDs.
+        let g1 = graph_with_ids(1, 2);
+        let g2 = graph_with_ids(10, 11);
+
+        let fp1 = graph_fingerprint(&g1);
+        let fp2 = graph_fingerprint(&g2);
+
+        assert_ne!(
+            fp1, fp2,
+            "core graph_fingerprint must change when representation IDs change"
+        );
+    }
+
+    #[test]
+    fn graph_fingerprint_deterministic_for_same_representation() {
+        let g = graph_with_ids(7, 8);
+        assert_eq!(graph_fingerprint(&g), graph_fingerprint(&g));
+    }
 }
